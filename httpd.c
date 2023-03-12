@@ -25,12 +25,25 @@
 #define STDOUT 1
 #define STDERR 2
 
+/**********************************************************************/
+/* Print out an error message with perror() (for system errors; based
+ * on value of errno, which indicates system call errors) and exit the
+ * program indicating an error. */
+/**********************************************************************/
 void error_msg(const char *str)
 {
     perror(str);
     exit(EXIT_FAILURE);
 }
 
+/**********************************************************************/
+/* This function starts the process of listening for web connections
+ * on a specified port.  If the port is 0, then dynamically allocate a
+ * port and modify the original port variable to reflect the actual
+ * port.
+ * Parameters: pointer to variable containing the port to connect on
+ * Returns: the socket */
+/**********************************************************************/
 int startup_tcp_socket(u_short port)
 {
     assert(port != 0);
@@ -45,8 +58,9 @@ int startup_tcp_socket(u_short port)
     struct sockaddr_in srv_sock_addr;
     memset(&srv_sock_addr, 0, sizeof(srv_sock_addr));
     srv_sock_addr.sin_family = AF_INET;
-    srv_sock_addr.sin_addr.s_addr = htonl(INADDR_ANY);  // 即 0.0.0.0 表示监听本机所有的 IP 地址。
-    srv_sock_addr.sin_port = htons(port);
+    srv_sock_addr.sin_addr.s_addr = htonl(INADDR_ANY);  // INADDR_ANY 即 0.0.0.0 表示监听本机所有的 IP 地址。
+                                                        // htonl() 将字符串类型 IP 转换为 unsigned long 类型，以符合 unsigned long a_addr 类型定义。
+    srv_sock_addr.sin_port = htons(port);               // htons() 将字符串类型 Port 转换为 unsigned short 类型，以符合 unsigned short int sin_port 类型定义。
 
     /* 设置 Server Socket 选项。*/
     int optval = 1;
@@ -77,9 +91,10 @@ int startup_tcp_socket(u_short port)
 }
 
 /**********************************************************************/
-/* 从 Socket 中读取一行数据，以 \n 换行、\r 回车、CLRF 组合、\0 空字符表示 EOF。
- *   - 如果 socket buffer 中读取到 EOF，则 buff String 以 \n\0 结尾。
- *   - 如果 socket buffer 结束但未找到 EOF，则 buff String 以 \0 结尾。
+/* 从 Socket Buffer 中读取 HTTP Requeset 中的一行数据。
+ * 每调用一次就读取一行，以 \n、\r 或 \r\n 表示 EOL（End of Line）。
+ *   - 如果 socket buffer 中读取到 EOL，则转化为 \n\0 结尾。
+ *   - 如果 socket buffer 结束但未找到 EOL，则 buff String 以 \0 结尾。
  * Parameters：
  *   - socket fd、buff string、line size。
  * Returns：
@@ -91,7 +106,8 @@ int get_line(int socket_fd, char *buff, int size)
     char c = '\0';
 
     /**
-     * 接收指定 Client Socket 发出的数据。示例：
+     * 接收指定 Client Socket 发出的数据。
+     * HTTP request start line 总是以 /r/n 结尾。示例：
 normal char: G
 normal char: E
 normal char: T
@@ -115,10 +131,10 @@ CLRF char: 0A
         if (n > 0)
         {
             /* CLRF \r\n 组合检测 */
-            if (c == '\r')  // 回车检测
+            if (c == '\r')  // 回车检测，如果是 \r，就继续看看紧跟的是不是 \n？
             {
                 n = recv(socket_fd, &c, 1, MSG_PEEK);
-                if ((n > 0) && (c == '\n'))  // 换行检测
+                if ((n > 0) && (c == '\n'))  // 换行检测，如果是 \n，那就取出丢弃。
                 {
                     recv(socket_fd, &c, 1, 0);
                 }
@@ -127,19 +143,25 @@ CLRF char: 0A
                     c = '\n';
                 }
             }
+
+            /* 不是 \n 或 \r\n，那就是有效数据。*/
             buff[i] = c;
             i++;
         }
         else
         {
+            /* 没数据了，退出读取。*/
             c = '\n';
         }
     }
-    buff[i] = '\0';  // 以 \0 作为读取字符串的结束。
+
+    buff[i] = '\0';  // Buff String 以 \0 作为读取字符串的结束。
     return i;
 }
 
 /**
+ * Inform the client that the requested web method has not been implemented.
+ * 
  * HTTP Response Header:
  *  HTTP/1.0 501 Method Not Implemented
  *  Server: jdbhttpd/0.1.0
@@ -181,6 +203,8 @@ void unimplemented(intptr_t cli_socket_fd)
 }
 
 /**
+ * Give a client a 404 not found status message.
+ * 
  * HTTP Response Header:
  *  HTTP/1.0 404 NOT FOUND
  *  Server: jdbhttpd/0.1.0
@@ -400,8 +424,8 @@ void execute_cgi(intptr_t cli_socket_fd, const char *path,
     }
 
     /* 创建 In/Out 两个 Pipe，用于父子进程间通信。*/
-    int cgi_input[2];   // 1：输入端，0：输出端。
-    int cgi_output[2];  // 1：输入端，0：输出端。
+    int cgi_input[2];   // 0：输出端，1：输入端。
+    int cgi_output[2];  // 0：输出端，1：输入端。
     if (pipe(cgi_input) < 0)   // Input Pipe
     {
         cannot_execute(cli_socket_fd);
@@ -430,10 +454,14 @@ void execute_cgi(intptr_t cli_socket_fd, const char *path,
      */
     if (0 == pid)
     {  // 子进程
-        dup2(cgi_input[0], STDIN);    // cgi_input 输出端重定向到 STDIN
-        dup2(cgi_output[1], STDOUT);  // cgi_output 输入端重定向到 STDOUT
-        close(cgi_input[1]);          // 关闭 cgi_input 输入端
-        close(cgi_output[0]);         // 关闭 cgi_output 输出端
+
+        /* 管道重定向：cgi_input[0] -> STDIN -> STDOUT -> cgi_output[1] */
+        dup2(cgi_input[0], STDIN);    // cgi_input 管道的输出端重定向到 STDIN；
+        dup2(cgi_output[1], STDOUT);  // cgi_output 管道的输入端重定向到 STDOUT；
+
+        /* 子进程不需要 cgi_input 输入端，和 cgi_output 输出端，这两端在父进程处理。*/
+        close(cgi_input[1]);          // 关闭 cgi_input 输入端；
+        close(cgi_output[0]);         // 关闭 cgi_output 输出端；
 
         /* 设置 CGI 程序的运行时环境变量。*/
         char meth_env[255];
@@ -452,29 +480,32 @@ void execute_cgi(intptr_t cli_socket_fd, const char *path,
             putenv(length_env);
         }
 
+        // 子进程调用 path 指定的 Perl CGI 脚本程序。
         execl(path, NULL);
         exit(0);
     }
     else
     {  // 父进程
         char c = '\0';
-        close(cgi_output[1]);
+
         close(cgi_input[0]);
+        close(cgi_output[1]);
 
         /* 将 POST request 通过 Pipe 传递到子进程。*/
         if (0 == strcasecmp(method, "POST"))
         {
             for (int i=0; i < content_len; i++)
             {
+                /* 将 Client Request 以 Byte steam 的形式写入子进程。*/
                 recv(cli_socket_fd, &c, 1, 0);
-                write(cgi_input[1], &c, 1);
+                write(cgi_input[1], &c, 1);  
 #ifdef DEBUG
                 printf("content char: %c", c);
 #endif
             }
         }
 
-        /* 从 cgi_output Pipe 输出端口读取子进程的处理结构，然后响应到 Client。*/
+        /* 从 cgi_output 输出端口读取子进程的处理结果，然后响应到 Client。*/
         while (read(cgi_output[0], &c, 1) > 0)
         {
             send(cli_socket_fd, &c, 1, 0);
@@ -488,6 +519,22 @@ void execute_cgi(intptr_t cli_socket_fd, const char *path,
     }
 }
 
+/**********************************************************************
+ * 处理 Client Request。支持 GET 和 POST Methods。
+ * 
+ * e.g.
+ *  GET / HTTP/1.1
+ *  Host: localhost:8086
+ *  ...
+ * 
+ * or
+ *  POST /color1.cgi HTTP/1.1
+ *  Host: localhost:8086
+ *  Content-Length: 10
+ *  ...
+ *  Form Data
+ *  color=yellow
+ **********************************************************************/
 void request_handle(void *arg)
 {
     intptr_t cli_socket_fd = (intptr_t)arg;
@@ -500,7 +547,7 @@ void request_handle(void *arg)
     printf("Recevice message from client:\n");
     printf("buff: %s", buff);
     printf("num_chars: %zu\n", num_chars);
-    /* 测试：curl localhost:6666
+    /* 测试：curl localhost:8086
 buff: GET / HTTP/1.1
 num_chars: 15
      */
@@ -508,7 +555,7 @@ num_chars: 15
 
     /* 将 HTTP Method 存入 method 中。*/
     char method[255];
-    size_t method_part = 0;  // e.g. `GET`
+    size_t method_part = 0;
     while (!IS_SPACE(buff[method_part]) && (method_part < sizeof(method)-1))
     {
         method[method_part] = buff[method_part];
@@ -559,19 +606,20 @@ url: /index.html
     }
 
     /* 处理 GET 请求的 Query String，如果存在，还需要开启 Perl CGI。*/
-    char *query_str = NULL;  // e.g. /index.html?color=red
+    char *query_str = NULL;  // query string 入口指针
     if (0 == strcasecmp(method, "GET"))
     {
-        query_str = url;  // 传递 URL 字符串入口。
+        query_str = url;  // 初始指向 URL 字符串入口
         while ((*query_str != '?') && (*query_str != '\0'))
         {
             query_str++;
         }
+
         if (*query_str == '?')
         {
             cgi_on = 1;
-            *query_str = '\0';
-            query_str++;
+            *query_str = '\0';  // 将 ? 替换为空字符
+            query_str++;  // query_str 指向 ? 后的参数
         }
     }
 
@@ -604,15 +652,18 @@ path: htdocs/index.html
     }
     else
     {
+        /* 判断 path 是否为目录。*/
         if (S_IFDIR == (st.st_mode & S_IFMT))
         {
             strcat(path, "/index.html");
         }
+        /* 判断文件是否具有执行权限。*/
         if ((st.st_mode & S_IXUSR) || (st.st_mode & S_IXGRP) || (st.st_mode & S_IXOTH))
         {
             cgi_on = 1;
         }
 
+        /* 是否需要执行 CGI 程序。*/
         if (!cgi_on)
         {
 #ifdef DEBUG
@@ -632,9 +683,13 @@ path: htdocs/index.html
     close(cli_socket_fd);
 }
 
+
+/*************************
+ * MAIN
+ *************************/
 int main(void)
 {
-    u_short port = 4001;
+    u_short port = 8086;  // 自定义 Socket 端口。
     int srv_socket_fd = startup_tcp_socket(port);
     printf("httpd running on port %d\n", port);
 
