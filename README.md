@@ -1,6 +1,6 @@
 # tinyhttpd
 
-Tiny HTTP Server
+Tiny HTTP Server 适用于学习并理解 TCP 协议、HTTP 协议以及 HTTP 服务器的设计与实现。
 
 # Use Guide
 
@@ -22,4 +22,4 @@ $ curl http://localhost:8086/
 ```
 
 # Documents & Blog
-[《用 C 语言开发一个轻用 C 语言开发一个》](https://blog.csdn.net/Jmilk/article/details/107193674)
+[《用 C 语言开发一个轻量级 HTTP 服务器》](https://blog.csdn.net/Jmilk/article/details/107193674)
