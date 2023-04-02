@@ -1,10 +1,18 @@
 # tinyhttpd
 
-Tiny HTTP Server 适用于学习并理解 TCP 协议、HTTP 协议以及 HTTP 服务器的设计与实现。
+1. 实现了基于 epoll 和非阻塞 I/O 的 TCP Socket。
+2. 实现了 HTTP/1 协议，支持 GET 和 PUT 方式。
+3. 实现了 Perl CGI 应用程序。
+4. 使用了 fork 子进程。
+5. 使用了 pthread 线程处理 Client 请求。
 
 # Use Guide
 
+- 操作系统：CentOS 7
+
+
 ```bash
+$ yum install perl-core -y
 $ perl -e shell -MCPAN
 <cpan> install CGI
 

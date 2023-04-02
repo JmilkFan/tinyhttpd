@@ -5,12 +5,21 @@
 #include <unistd.h>
 #include <assert.h>
 #include <ctype.h>
-
 #include <pthread.h>
+#include <fcntl.h>
+#include <netdb.h>
 
 #include <sys/socket.h>
-#include <arpa/inet.h>
 #include <sys/stat.h>
+#include <sys/epoll.h>
+#include <arpa/inet.h>
+
+#define SUCCESS 0
+#define FAIL -1
+
+/* epoll 并发规格参数。 */
+#define MAX_EVENTS 10
+
 
 /**
  * <ctype.h>
@@ -32,6 +41,7 @@
 /**********************************************************************/
 void error_msg(const char *str)
 {
+    fprintf(stderr, "ERROR code: %d \n", errno);
     perror(str);
     exit(EXIT_FAILURE);
 }
@@ -48,11 +58,10 @@ int startup_tcp_socket(u_short port)
 {
     assert(port != 0);
 
-    /* 创建 Server Socket。*/
+    /* 创建 Server Socket fd 实例。*/
     int srv_socket_fd = 0;
-    if (-1 == (srv_socket_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP))) {
+    if (-1 == (srv_socket_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)))
         error_msg("Create socket failed");
-    }
 
     /* 配置 Server Sock 信息。*/
     struct sockaddr_in srv_sock_addr;
@@ -62,7 +71,7 @@ int startup_tcp_socket(u_short port)
                                                         // htonl() 将字符串类型 IP 转换为 unsigned long 类型，以符合 unsigned long a_addr 类型定义。
     srv_sock_addr.sin_port = htons(port);               // htons() 将字符串类型 Port 转换为 unsigned short 类型，以符合 unsigned short int sin_port 类型定义。
 
-    /* 设置 Server Socket 选项。*/
+    /* 设置 Server Socket fd 选项。*/
     int optval = 1;
     if (setsockopt(srv_socket_fd,
                    SOL_SOCKET,    // 表示套接字选项的协议层。
@@ -73,7 +82,7 @@ int startup_tcp_socket(u_short port)
         error_msg("Set sock options failed");
     }
 
-    /* 绑定 Socket 与 Sock Address 信息。*/
+    /* 绑定 Server Socket fd 与 Sock Address 信息。*/
     if (-1 == bind(srv_socket_fd,
                    (struct sockaddr *)&srv_sock_addr,
                    sizeof(srv_sock_addr)))
@@ -81,7 +90,7 @@ int startup_tcp_socket(u_short port)
         error_msg("Bind socket failed");
     }
 
-    /* 开始监听 Client 发出的连接请求。*/
+    /* Server Socket fd 开始监听 Client 发出的连接请求。*/
     if (-1 == listen(srv_socket_fd, 10))
     {
         error_msg("Listen socket failed");
@@ -135,13 +144,9 @@ CLRF char: 0A
             {
                 n = recv(socket_fd, &c, 1, MSG_PEEK);
                 if ((n > 0) && (c == '\n'))  // 换行检测，如果是 \n，那就取出丢弃。
-                {
                     recv(socket_fd, &c, 1, 0);
-                }
                 else
-                {
                     c = '\n';
-                }
             }
 
             /* 不是 \n 或 \r\n，那就是有效数据。*/
@@ -494,7 +499,8 @@ void execute_cgi(intptr_t cli_socket_fd, const char *path,
         /* 将 POST request 通过 Pipe 传递到子进程。*/
         if (0 == strcasecmp(method, "POST"))
         {
-            for (int i=0; i < content_len; i++)
+            int i;
+            for (i=0; i < content_len; i++)
             {
                 /* 将 Client Request 以 Byte steam 的形式写入子进程。*/
                 recv(cli_socket_fd, &c, 1, 0);
@@ -680,41 +686,147 @@ path: htdocs/index.html
         }
     }
 
+    /* 关闭 Client Socket fd，epoll 实例也会从监听 fds 列表中删除这个 fd。*/
     close(cli_socket_fd);
 }
+
 
 
 /*************************
  * MAIN
  *************************/
+
+/* 设置 Socket 为非阻塞 I/O 模式。*/
+static int set_sock_non_blocking(int sock_fd)
+{
+    int flags;
+
+    if (FAIL == (flags = fcntl(sock_fd, F_GETFL, 0)))
+    {
+        error_msg("fcntl1");
+        return FAIL;
+    }
+
+    flags |= O_NONBLOCK;
+    if (FAIL == fcntl(sock_fd, F_SETFL, flags))
+    {
+        error_msg("fcntl2");
+        return FAIL;
+    }
+
+    return SUCCESS;
+}
+
 int main(void)
 {
+    
     u_short port = 8086;  // 自定义 Socket 端口。
     int srv_socket_fd = startup_tcp_socket(port);
+    
+    /* 设置 Server Socket fd 为非阻塞模式。*/
+    if (FAIL == set_sock_non_blocking(srv_socket_fd))
+    {
+        error_msg("set_sock_non_blocking");
+        close(srv_socket_fd);
+    }
+
+    /* 创建一个 epoll 实例。*/
+    int epoll_fd = -1;
+    if (FAIL == (epoll_fd = epoll_create1(0)))
+    {
+        error_msg("epoll_create");
+    }
+
+    /* 定义 epoll ctrl event 和 callback events 实例 */
+    struct epoll_event event, events[MAX_EVENTS];
+    // 将 Server Socket fd 添加到 epoll 实例的监听列表中
+    event.data.fd = srv_socket_fd;
+    // 设置 epoll 的 Events 类型为 EPOLLIN（可读事件）和 EPOLLET（采用 ET 模式）
+    event.events = EPOLLIN | EPOLLET;
+    // 将 Server Socket fd 添加（EPOLL_CTL_ADD）到 epoll 实例的监听列表中，并设定监听事件类型。
+    if (FAIL == epoll_ctl(epoll_fd, EPOLL_CTL_ADD, srv_socket_fd, &event))
+    {
+        error_msg("epoll_ctl");
+    }
+
     printf("httpd running on port %d\n", port);
-
-    /* 初始化 Client Sock 信息存储器变量。*/
-    struct sockaddr cli_sock_addr;
-    memset(&cli_sock_addr, 0, sizeof(cli_sock_addr));
-    int cli_sockaddr_len = sizeof(cli_sock_addr);
-
-    int cli_socket_fd = 0;
-    pthread_t newthread;
+    int i, event_cnt;
     while (1)
     {
-        if (-1 == (cli_socket_fd = accept(srv_socket_fd,
-                                          (struct sockaddr *)(&cli_sock_addr),  // 填充 Client Sock 信息。
-                                          (socklen_t *)&cli_sockaddr_len)))
+        /* epoll 实例开始等待事件，一次最多可返回 MAX_EVENTS 个事件，并存放到 events 容器中。*/
+        event_cnt = epoll_wait(epoll_fd, events, 64, -1);
+        for (i = 0; i < event_cnt; ++i)
         {
-            error_msg("Accept connection from client failed");
-        }
+            /* Server Socket fd 有可读事件，表示有 Client 发起了连接请求。*/
+            if (srv_socket_fd == events[i].data.fd)
+            {
+                printf("Accepted client connection request.\n");
+                for ( ;; )
+                {
+                    /* 初始化 Client Sock 信息存储器变量。*/
+                    struct sockaddr cli_sock_addr;
+                    memset(&cli_sock_addr, 0, sizeof(cli_sock_addr));
+                    int cli_sockaddr_len = sizeof(cli_sock_addr);
 
-        if (pthread_create(&newthread,
-                           NULL,
-                           (void *)request_handle,
-                           (void *)(intptr_t)cli_socket_fd) != 0)
-        {
-            error_msg("pthread create failed");
+                    int cli_socket_fd = 0;
+                    if (FAIL == (cli_socket_fd = accept(srv_socket_fd,
+                                                        (struct sockaddr *)(&cli_sock_addr),  // 填充 Client Sock 信息。
+                                                        (socklen_t *)&cli_sockaddr_len)))
+                    {
+                        /* 如果是 EAGAIN（Try again ）错误或非阻塞 I/O 的 EWOULDBLOCK（Operation would block）错误通知，则直接 break，继续循环，直到 “数据就绪” 为止。*/
+                        if ((errno == EAGAIN) || (errno == EWOULDBLOCK))
+                            break;
+                        else
+                            error_msg("Accept connection from client failed");
+                            break;
+                    }
+
+                    /* 将一个 socket addr 转换为对应的 Hostname 和 Service name */
+                    char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
+                    if (SUCCESS == getnameinfo(&cli_sock_addr, cli_sockaddr_len, hbuf, sizeof(hbuf), sbuf, sizeof(sbuf), NI_NAMEREQD | NI_NUMERICHOST))
+                        printf("Accepted connection on descriptor %d (host=%s, port=%s)\n", cli_socket_fd, hbuf, sbuf);
+                    else
+                        printf("Accepted connection on descriptor %d\n", cli_socket_fd);
+
+                    /* 设置 Client Socket 为非阻塞 I/O 模式。*/
+                    if (FAIL == set_sock_non_blocking(cli_socket_fd))
+                    {
+                        error_msg("set_sock_non_blocking");
+                        close(cli_socket_fd);
+                        break;
+                    }
+
+                    /* 将 Client Socket fd 添加到 epoll 实例的监听列表中 */
+                    event.data.fd = cli_socket_fd;
+                    event.events = EPOLLIN | EPOLLET;  // 设定可读监听事件，并采用 ET 模式。
+                    if (-1 == epoll_ctl(epoll_fd, EPOLL_CTL_ADD, cli_socket_fd, &event))  // 添加 Client Socket fd 及其监听事件。
+                    {
+                        error_msg("epoll_ctl");
+                        close(cli_socket_fd);
+                        break;
+                    }
+                }
+            }
+
+            /* 发生了数据等待读取事件。因为 epoll 实例正在使用 ET 模式，所以必须完全读取所有可用数据，否则不会再次收到相同数据的通知。*/
+            else if (events[i].events & EPOLLIN)
+            {
+                pthread_t newthread;
+                int cli_socket_fd = events[i].data.fd;
+
+                if (pthread_create(&newthread,
+                                   NULL,
+                                   (void *)request_handle,
+                                   (void *)(intptr_t)cli_socket_fd) != 0)
+                {
+                    error_msg("pthread create failed");
+                }
+            }
+            /* 发生了 epoll 异常事件，直接关闭 Client Socket fd。*/
+            else if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP) || (!(events[i].events & EPOLLIN))) {
+                error_msg("epoll error.");
+                close(events[i].data.fd);
+            }
         }
     }
 
